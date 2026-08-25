@@ -20,20 +20,23 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
 
 ```
 [CLI User / Env]
-    │  (book_id | URN | URL, --jwt | OREILLY_JWT, -o output, -c concurrency)
+    │  (book_id | URN | URL, --jwt | OREILLY_JWT in .env, -o output, -c concurrency)
     ▼
 [main()]
-    ├─► [extract_book_id()] ──► Normalizza input in ID numerico/stringa
-    ├─► [resolve_output_path()] ──► Determina path file di output (.epub o custom dir)
+    ├─► [normalize_book_id()] ──► Normalizza input in ID ed esegue auto-correzione ISBN-13 (12 -> 13 cifre)
+    ├─► [resolve_jwt()] ───────► Risolve e sanitizza JWT (priorità CLI -> .env con override)
+    ├─► [resolve_output_path()] ─► Determina path file di output (.epub o custom dir)
     │
     ▼
 [amain()]
     │
-    ├─► [check_auth()] ──► GET https://learning.oreilly.com/api/v1/user-preferences/
+    ├─► [get_jwt_expiration()] ─► Ispezione locale claim 'exp' con avviso data/ora se scaduto
+    ├─► [get_auth_config()] ────► Assembla headers (DEFAULT_HEADERS + Bearer) e cookies (orm-jwt)
+    ├─► [check_auth()] ────────► GET https://learning.oreilly.com/api/v1/user-preferences/
     │
-    └─► [fetch_book()] ──► Inizializza archivio ZIP ({output_file})
-            │               - mimetype (application/epub+zip, non compresso)
-            │               - META-INF/container.xml
+    └─► [fetch_book()] ────────► Inizializza archivio ZIP ({output_file})
+            │                     - mimetype (application/epub+zip, non compresso)
+            │                     - META-INF/container.xml
             │
             ├─► GET https://learning.oreilly.com/api/v2/epubs/urn:orm:book:{book_id}/files/
             │   (paginazione automatica con URL 'next')
@@ -43,10 +46,10 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
                     ├─► File binari/asset (.css, .png, .jpg, .svg, .ncx, .opf...)
                     │     └─► Scrittura diretta in EPUB/{full_path}
                     │
-                    └─► File di testo/capitoli (.html)
-                          ├─► [to_xhtml()]
+                    └─► File di testo/capitoli (.html, .xhtml)
+                          ├─► [to_xhtml(s, root_path, full_path)]
                           │     - Normalizzazione tag e doctype XHTML
-                          │     - Rimozione prefisso API dai percorsi relativi ('href', 'src')
+                          │     - Riscrittura percorsi relativi via posixpath.relpath (es. ../Images/pic.png da Text/)
                           │     - Wrapping in <html xmlns="http://www.w3.org/1999/xhtml"> se incompleto
                           │     - Generazione tag <head><title> da <h1>
                           └─► Scrittura in EPUB/{full_path}
@@ -54,14 +57,20 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
 
 ### Dettaglio Componenti e Funzioni
 1. **`main()` / `amain()`**: Entrypoint CLI e runner asincrono. Gestisce il cleanup automatico del file parziale in caso di errori fatali.
-2. **`extract_book_id(val)`**: Parser di input flessibile che accetta ID numerici, ISBN, formato URN (`urn:orm:book:...`) e URL completi della piattaforma O'Reilly.
-3. **`resolve_output_path(output_arg, book_id)`**: Risolve il path di destinazione gestendo file specifici, directory esistenti o la directory corrente.
-4. **`check_auth(session)`**: Verifica la validità del cookie JWT interrogando `/api/v1/user-preferences/`.
-5. **`fetch_book(book_id, zfh, session, concurrency)`**:
+2. **`normalize_book_id(raw_id)`**: Estrae l'ID tramite `extract_book_id` e corregge automaticamente prefissi ISBN-13 a 12 cifre calcolando la cifra di controllo con `isbn13_check_digit`.
+3. **`extract_book_id(val)`**: Parser di input flessibile che accetta ID numerici, ISBN, formato URN (`urn:orm:book:...`) e URL completi della piattaforma O'Reilly.
+4. **`isbn13_check_digit(prefix)`**: Calcola la cifra di controllo modulo 10 ponderata per ISBN-13.
+5. **`resolve_jwt(cli_jwt)`**: Risolve e sanitizza il token (priorità CLI `--jwt` > variabile `OREILLY_JWT` in `.env`, rimozione spazi, apici e prefisso `Bearer `).
+6. **`get_jwt_expiration(token)`**: Decodifica il claim `exp` dal payload JWT senza verifica crittografica per avvisare preventivamente l'utente in caso di token scaduto.
+7. **`get_auth_config(jwt)`**: Costruisce `DEFAULT_HEADERS` con `User-Agent` realistico, `Authorization: Bearer <jwt>` e cookie `orm-jwt: <jwt>`.
+8. **`resolve_output_path(output_arg, book_id)`**: Risolve il path di destinazione gestendo file specifici, directory esistenti o la directory corrente.
+9. **`check_auth(session)`**: Verifica la validità del cookie JWT interrogando `/api/v1/user-preferences/`.
+10. **`fetch_book(book_id, zfh, session, concurrency)`**:
    - Predispone la struttura standard EPUB conforme OEBPS (`mimetype`, `META-INF/container.xml`).
    - Cicla sulle pagine dell'API O'Reilly scaricando la lista dei file costituenti il libro.
    - Esegue il download asincrono controllato da `asyncio.Semaphore` per prevenire rate-limiting (HTTP 429).
-6. **`to_xhtml(s, root_path)`**: Converte l'HTML in XHTML valido con namespace OEBPS e ripulisce gli attributi `src` e `href` per renderli relativi all'archivio EPUB.
+   - Invia i file `.html` e `.xhtml` a `to_xhtml()` prima della memorizzazione nello ZIP.
+11. **`to_xhtml(s, root_path, dest_path)`**: Converte l'HTML in XHTML valido con namespace OEBPS e ripulisce gli attributi `src` e `href` convertendoli in percorsi relativi alla sottodirectory del file (es. `../Images/pic.png` da `Text/chapter.html`).
 
 ---
 
@@ -94,8 +103,11 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
 |---|---|---|
 | Download incompleto o capitoli troncati | Cookie JWT assente, non valido o account privo di abbonamento attivo | Fornire un token JWT valido estratto dal browser (cookie `orm-jwt`) tramite `--jwt`, variabile `OREILLY_JWT` o file `.env`. |
 | `Warning: Authentication failed` / HTTP 403 su user-preferences | Protezione WAF/Akamai di O'Reilly che blocca lo User-Agent di default di `aiohttp` | Configurazione di `DEFAULT_HEADERS` realistici (`User-Agent`, `Accept`, `Referer`) nella `ClientSession`. |
+| Token in `.env` ignorato / token vecchio usato | La shell conteneva una variabile `OREILLY_JWT` precedentemente esportata | `load_dotenv(override=True)` garantisce che il file `.env` sovrascriva eventuali variabili d'ambiente stale. |
+| Download di 0 file per ISBN incompleto | ID a 12 cifre senza check digit (es. `978163343453`) | `normalize_book_id()` rileva prefissi a 12 cifre e calcola automaticamente la 13a cifra di controllo. |
 | `AttributeError: 'NoneType' object has no attribute 'startswith'` | Nodi di commento (`HtmlComment`) o attributi booleani durante `to_xhtml()` | Controllo esplicito su `val and isinstance(val, str) and val.startswith(...)` in `to_xhtml()`. |
-| Immagini o link interni non visualizzati | Percorsi assoluti dell'API non rimossi | La funzione `to_xhtml()` rimuove il prefisso `root_path` convertendoli in percorsi relativi interni all'archivio EPUB. |
+| Immagini o link non visibili nei reader EPUB | File HTML in sottocartelle (`EPUB/Text/`) ma percorsi privi di `../` per raggiungere `EPUB/Images/` | `to_xhtml()` calcola i percorsi relativi con `posixpath.relpath()` rispetto alla directory del file (`Text/` → `../Images/`). |
+| Copertina (`titlepage.xhtml`) non visualizzata | I file `.xhtml` non venivano processati da `to_xhtml()`, mantenendo percorsi API assoluti non validi | `fetch_book()` processa sia file `.html` che `.xhtml`. |
 | Rate limiting (HTTP 429) su libri enormi | Troppe richieste simultanee verso il server | Concorrenza limitata e configurabile con `asyncio.Semaphore` (default: 10). |
 
 ---
