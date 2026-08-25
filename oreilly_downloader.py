@@ -8,9 +8,13 @@
 
 import argparse
 import asyncio
+import base64
+import json
 import os
+import posixpath
 import re
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -21,11 +25,20 @@ from lxml import html as lhtml
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    # .env is the authoritative source: override any stale value already
+    # exported in the environment (e.g. from a previous shell export).
+    load_dotenv(override=True)
 except ImportError:
     pass
 
 BASE_URL = "https://learning.oreilly.com"
+
+DEFAULT_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://learning.oreilly.com/",
+}
 
 CONTAINER = b"""<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
@@ -34,6 +47,42 @@ CONTAINER = b"""<?xml version="1.0"?>
     </rootfiles>
 </container>
 """
+
+
+def resolve_jwt(cli_jwt: str | None = None) -> str | None:
+    """Resolve and sanitize JWT token from CLI argument or OREILLY_JWT in .env/environment."""
+    raw_token = cli_jwt if cli_jwt is not None else os.getenv("OREILLY_JWT")
+    if not raw_token:
+        return None
+    token = raw_token.strip().strip("'\"").removeprefix("Bearer ").strip()
+    return token if token else None
+
+
+def get_jwt_expiration(token: str | None) -> float | None:
+    """Extract expiration epoch timestamp ('exp') from JWT payload if present."""
+    if not token:
+        return None
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            payload_bytes = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_bytes))
+            exp = payload.get("exp")
+            if isinstance(exp, (int, float)):
+                return float(exp)
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def get_auth_config(jwt: str | None) -> tuple[dict[str, str], dict[str, str]]:
+    """Generate HTTP headers and cookies configured with the JWT token if present."""
+    headers = dict(DEFAULT_HEADERS)
+    cookies: dict[str, str] = {}
+    if jwt:
+        cookies["orm-jwt"] = jwt
+        headers["Authorization"] = f"Bearer {jwt}"
+    return headers, cookies
 
 
 def extract_book_id(input_val: str) -> str:
@@ -56,6 +105,22 @@ def extract_book_id(input_val: str) -> str:
     return val
 
 
+def isbn13_check_digit(prefix: str) -> str:
+    """Compute the ISBN-13 check digit for a 12-digit prefix."""
+    total = sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(prefix))
+    return str((10 - total % 10) % 10)
+
+
+def normalize_book_id(raw_id: str) -> str:
+    """Extract the book ID, auto-correcting ISBN-13 prefixes missing the check digit."""
+    book_id = extract_book_id(raw_id)
+    if re.fullmatch(r"97[89]\d{9}", book_id):
+        corrected = book_id + isbn13_check_digit(book_id)
+        print(f"Note: '{book_id}' is a 12-digit ISBN-13 prefix; using corrected ID '{corrected}'.")
+        return corrected
+    return book_id
+
+
 def resolve_output_path(output_arg: str | None, book_id: str) -> Path:
     """Resolve destination EPUB file path from CLI argument."""
     if not output_arg:
@@ -70,17 +135,28 @@ def resolve_output_path(output_arg: str | None, book_id: str) -> Path:
     return out_path
 
 
-def to_xhtml(s: bytes | str, root_path: str) -> bytes:
-    """Convert HTML content to valid XHTML conforming to EPUB specifications."""
+def to_xhtml(s: bytes | str, root_path: str, dest_path: str) -> bytes:
+    """Convert HTML content to valid XHTML conforming to EPUB specifications.
+
+    `root_path` is the API prefix removed from absolute resource URLs; `dest_path`
+    is the EPUB-relative destination of this file (e.g. 'Text/chapter-1.html') so
+    that resource references are rewritten relative to its directory.
+    """
     tree = lhtml.fromstring(s, parser=lhtml.HTMLParser(encoding="utf-8"))
+    dest_dir = posixpath.dirname(dest_path)
 
     for el in list(tree.iter()):
         for attr in ["href", "src"]:
-            val = el.get(attr, "")
+            val = el.get(attr)
+            if not val or not isinstance(val, str):
+                continue
             if val.startswith(root_path):
-                el.set(attr, val.removeprefix(root_path))
+                rel = val.removeprefix(root_path)
+                if dest_dir:
+                    rel = posixpath.relpath(rel, dest_dir)
+                el.set(attr, rel)
 
-    if tree.tag != "html":
+    if not isinstance(tree.tag, str) or tree.tag.lower() != "html":
         wrapper = etree.Element(
             "html",
             nsmap={
@@ -89,7 +165,7 @@ def to_xhtml(s: bytes | str, root_path: str) -> bytes:
             },
         )
 
-        h1 = tree.find(".//h1")
+        h1 = tree.find(".//h1") if isinstance(tree.tag, str) else None
         if h1 is not None:
             head = etree.SubElement(wrapper, "head")
             title = etree.SubElement(head, "title")
@@ -113,8 +189,12 @@ async def check_auth(session: aiohttp.ClientSession) -> bool:
     url = f"{BASE_URL}/api/v1/user-preferences/"
     try:
         async with session.get(url, raise_for_status=False) as r:
-            return r.ok
-    except aiohttp.ClientError:
+            if r.status == 200:
+                return True
+            print(f"Auth verification failed: HTTP {r.status} {r.reason}")
+            return False
+    except aiohttp.ClientError as e:
+        print(f"Auth verification network error: {e}")
         return False
 
 
@@ -128,13 +208,13 @@ async def fetch_book(
     root_path = f"/api/v2/epubs/urn:orm:book:{book_id}/files/"
     sem = asyncio.Semaphore(concurrency)
 
-    async def download(url: str, path: str):
+    async def download(url: str, full_path: str):
         async with sem, session.get(url) as r:
             r.raise_for_status()
             content = await r.read()
-            if path.endswith(".html"):
-                content = to_xhtml(content, root_path)
-            zfh.writestr(path, content)
+            if full_path.endswith((".html", ".xhtml")):
+                content = to_xhtml(content, root_path, full_path)
+            zfh.writestr(f"EPUB/{full_path}", content)
 
     zfh.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
     zfh.writestr("META-INF/container.xml", CONTAINER)
@@ -154,13 +234,16 @@ async def fetch_book(
         results = data.get("results", [])
         if results:
             print(f"  Downloading {len(results)} files (concurrency limit: {concurrency})...")
-            await asyncio.gather(*[download(result["url"], f"EPUB/{result['full_path']}") for result in results])
+            await asyncio.gather(*[download(result["url"], result["full_path"]) for result in results])
             total_files += len(results)
 
         url = data.get("next")
         page += 1
 
-    print(f"Completed download of {total_files} files.")
+    if total_files == 0:
+        print(f"Warning: no files returned for book ID '{book_id}'. The ID may be incorrect or the book is unavailable.")
+    else:
+        print(f"Completed download of {total_files} files.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -172,8 +255,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--jwt",
-        default=os.getenv("OREILLY_JWT"),
-        help="O'Reilly 'orm-jwt' cookie value (defaults to OREILLY_JWT environment variable)",
+        default=None,
+        help="O'Reilly 'orm-jwt' cookie value (defaults to OREILLY_JWT environment variable from .env)",
     )
     parser.add_argument(
         "-o",
@@ -192,16 +275,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def amain(book_id: str, jwt: str | None, output_file: Path, concurrency: int) -> None:
     """Main async execution routine."""
-    cookies = {"orm-jwt": jwt} if jwt else {}
+    resolved_jwt = resolve_jwt(jwt)
+    headers, cookies = get_auth_config(resolved_jwt)
+
+    if resolved_jwt:
+        exp = get_jwt_expiration(resolved_jwt)
+        if exp is not None and time.time() > exp:
+            exp_str = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(exp))
+            print(f"Warning: The provided JWT expired at {exp_str}.")
+            print("Please extract a fresh 'orm-jwt' cookie from your browser and update .env or --jwt.")
 
     with zipfile.ZipFile(output_file, "w") as zfh:
-        async with aiohttp.ClientSession(cookies=cookies) as session:
-            if not jwt:
-                print("Warning: No JWT provided (via --jwt or OREILLY_JWT). Chapters may be truncated.")
+        async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
+            if not resolved_jwt:
+                print("Warning: No JWT provided (via --jwt, .env, or OREILLY_JWT). Chapters may be truncated.")
             elif await check_auth(session):
                 print("Authentication successful.")
             else:
-                print("Warning: Authentication failed or token expired. Chapters may be truncated.")
+                print("Warning: Authentication check failed. Chapters may be truncated.")
 
             await fetch_book(
                 book_id=book_id,
@@ -217,7 +308,7 @@ def main() -> None:
     args = parser.parse_args()
 
     raw_id = args.book_id
-    book_id = extract_book_id(raw_id)
+    book_id = normalize_book_id(raw_id)
     if not book_id:
         print(f"Error: Could not extract a valid book ID from '{raw_id}'", file=sys.stderr)
         sys.exit(1)

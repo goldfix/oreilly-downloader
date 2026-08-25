@@ -7,20 +7,52 @@ This script allows you to download all the individual files and assemble them
 back into a full epub. This allows you to use other readers, e.g. for
 accessibility reasons.
 
-You need to have a valid JWT to download content. If you do not provide one,
-each chapter will be cut short. You can get it by logging in with your browser
-and extracting the `orm-jwt` cookie using the developer tools.
+You need a valid JWT to download content. If you do not provide one, each
+chapter will be cut short. You can get it by logging in with your browser and
+extracting the `orm-jwt` cookie using the developer tools.
 
 Before any usage, please read the [O'Reilly Terms of
 Service](https://learning.oreilly.com/terms/).
 
 # Usage
 
+## Setup
+
+The project uses `uv` for dependency management (Python 3.12):
+
+```bash
+source py_env.sh init 3.12   # create .venv and install dependencies
+source py_env.sh active      # activate .venv and load py_var.sh
 ```
-$ pip install aiohttp lxml
-$ python3 oreilly_downloader.py 9781491958698 --jwt 'XYZ'
-…
-created 9781491958698.epub
+
+## Providing the JWT token
+
+The token is resolved in this priority order:
+
+1. `--jwt` CLI argument;
+2. `OREILLY_JWT` environment variable (e.g. from a `.env` file next to the
+   project — `.env` is ignored by git).
+
+```bash
+# Option A: pass the token explicitly
+uv run python oreilly_downloader.py 9781491958698 --jwt 'XYZ'
+
+# Option B: store it in .env (recommended, keeps it out of shell history)
+echo 'OREILLY_JWT=XYZ' >> .env
+uv run python oreilly_downloader.py 9781491958698
+```
+
+## Options
+
+| Option | Description | Default |
+|---|---|---|
+| `book_id` | Book ID, ISBN, `urn:orm:book:...`, or full O'Reilly URL | required |
+| `--jwt` | O'Reilly `orm-jwt` cookie value | `OREILLY_JWT` from `.env` |
+| `-o, --output` | Output file or directory path | `<book_id>.epub` |
+| `-c, --concurrency` | Maximum concurrent file downloads | `10` |
+
+```bash
+uv run python oreilly_downloader.py https://learning.oreilly.com/library/view/fluent-python-2nd/9781492056348/ -o out/ -c 5
 ```
 
 # Contributing

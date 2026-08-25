@@ -93,6 +93,8 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
 | Problema | Causa | Soluzione |
 |---|---|---|
 | Download incompleto o capitoli troncati | Cookie JWT assente, non valido o account privo di abbonamento attivo | Fornire un token JWT valido estratto dal browser (cookie `orm-jwt`) tramite `--jwt`, variabile `OREILLY_JWT` o file `.env`. |
+| `Warning: Authentication failed` / HTTP 403 su user-preferences | Protezione WAF/Akamai di O'Reilly che blocca lo User-Agent di default di `aiohttp` | Configurazione di `DEFAULT_HEADERS` realistici (`User-Agent`, `Accept`, `Referer`) nella `ClientSession`. |
+| `AttributeError: 'NoneType' object has no attribute 'startswith'` | Nodi di commento (`HtmlComment`) o attributi booleani durante `to_xhtml()` | Controllo esplicito su `val and isinstance(val, str) and val.startswith(...)` in `to_xhtml()`. |
 | Immagini o link interni non visualizzati | Percorsi assoluti dell'API non rimossi | La funzione `to_xhtml()` rimuove il prefisso `root_path` convertendoli in percorsi relativi interni all'archivio EPUB. |
 | Rate limiting (HTTP 429) su libri enormi | Troppe richieste simultanee verso il server | Concorrenza limitata e configurabile con `asyncio.Semaphore` (default: 10). |
 
@@ -114,3 +116,44 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
   - Creazione suite di test unitari in `tests/test_downloader.py` (5 test passati al 100%).
   - Aggiornamento di `.gitignore` per escludere `*.epub`.
   - Redazione completa di `AGENTS.md` e `MEMORY.md`.
+
+### Sessione 2 - Centralizzazione Token (.env/CLI), Diagnostica Scadenza JWT e Suite di Test (2026-08-25)
+- **Attività**:
+  - Centralizzazione della gestione del token di autenticazione:
+    - Lettura delle variabili d'ambiente esclusivamente dal file `.env` (tramite `load_dotenv()`).
+    - Creazione di `resolve_jwt(cli_jwt)`: dà precedenza a `--jwt` su `OREILLY_JWT` in `.env`, ripulisce spazi, apici e prefissi `Bearer `.
+    - Creazione di `get_jwt_expiration(token)`: decodifica il payload JWT per individuare e segnalare con precisione la scadenza (`exp`) prima o durante le richieste.
+    - Creazione di `get_auth_config(jwt)`: assembla in modo univoco `headers` (`DEFAULT_HEADERS` + `Authorization: Bearer <jwt>`) e `cookies` (`orm-jwt: <jwt>`).
+  - Risoluzione del falso avviso e diagnosi autenticazione:
+    - Identificata scadenza temporale effettiva del token nel payload (`exp`).
+    - Introdotti `DEFAULT_HEADERS` per superare i blocchi bot/WAF (Akamai 403).
+  - Risolto bug `AttributeError: 'NoneType' object has no attribute 'startswith'` in `to_xhtml()` per nodi `HtmlComment` e attributi non-string.
+  - Aggiornata e ampliata la suite di test in `tests/test_downloader.py` a **15 test unitari e di integrazione**:
+    - Precedenza e pulizia token con `resolve_jwt`.
+    - Estrazione timestamp scadenza con `get_jwt_expiration`.
+    - Configurazione coerente di header e cookie con `get_auth_config`.
+    - Test live `test_live_auth_from_env` con skip controllato se il token in `.env` è assente o scaduto.
+  - Esecuzione e verifica linting (`ruff check`) e formattazione (`ruff format`).
+
+### Sessione 3 - Fix Token Stale da Ambiente e Verifica End-to-End (2026-08-25)
+- **Attività**:
+  - Risolto problema del token ignorato: lo script usava una variabile `OREILLY_JWT` ancora esportata nella shell (scaduta) perché `load_dotenv()` di default non sovrascrive le variabili d'ambiente esistenti.
+  - Cambiato il caricamento in `load_dotenv(override=True)` in `oreilly_downloader.py` e nel test live: ora il file `.env` è la fonte autorevole e prevale su eventuali export stale nella shell (allineato alla priorità documentata in README: `--jwt` → `.env`).
+  - Identificato e verificato un book ID errato: `978163343453` (12 cifre, incompleto) restituiva `count: 0`; l'ISBN-13 corretto `9781633434530` restituisce 144 file dall'API.
+  - Suite di test: **15 passati al 100%** (`uv run pytest`), incluso il test live di autenticazione con il token valido del `.env`.
+
+### Sessione 4 - Auto-Correzione ISBN-13 e Avviso 0 File (2026-08-25)
+- **Attività**:
+  - Aggiunta `isbn13_check_digit(prefix)`: calcola la cifra di controllo ISBN-13 per un prefisso a 12 cifre.
+  - Aggiunta `normalize_book_id(raw_id)`: estrae l'ID e corregge automaticamente i prefissi ISBN-13 a 12 cifre (regex `97[89]\d{9}`) aggiungendo la cifra di controllo mancante, con nota a console.
+  - Aggiunto avviso in `fetch_book()` quando un libro restituisce 0 file (ID errato o libro non disponibile).
+  - Verifica end-to-end: `978163343453` viene corretto in `9781633434530`, download di 144 file e creazione di un EPUB valido (mimetype primo e non compresso, struttura EPUB/Text, toc.ncx).
+  - Suite di test portata a **17 test passati al 100%** (`uv run pytest`), lint e format ok (`ruff`).
+
+### Sessione 5 - Fix Percorsi Risorse nelle Sottocartelle (EPUB) (2026-08-25)
+- **Attività**:
+  - Risolto il problema delle immagini non visibili nell'EPUB: le risorse venivano referenziate come `Images/x.png` (relative alla radice EPUB) ma gli HTML vivono in `EPUB/Text/`, quindi i percorsi dovevano includere `../`.
+  - `to_xhtml()` ora accetta `dest_path` (es. `Text/chapter-1.html`) e riscrive i riferimenti assoluti API con `posixpath.relpath()` rispetto alla directory di destinazione (es. `../Images/x.png`, link tra capitoli `ch02.html`).
+  - `fetch_book()` ora processa anche i file `.xhtml` (prima solo `.html`): la copertina `Text/titlepage.xhtml` non era convertita e conteneva il percorso API assoluto rotto.
+  - Verifica end-to-end: EPUB rigenerato con `../Images/...` corretti, zero percorsi API assoluti residui e **0 riferimenti rotti** (ogni src/href risolve a un file esistente nell'archivio).
+  - Suite di test portata a **19 test passati al 100%** (`uv run pytest`), lint e format ok (`ruff`).
