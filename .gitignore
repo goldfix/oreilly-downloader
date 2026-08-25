@@ -1,0 +1,38 @@
+# Environment and secrets
+.env
+.env.*
+py_var.sh
+key.json
+
+# Downloaded EPUB files
+*.epub
+
+# Python virtual environments & bytecode
+.venv/
+py-env/
+conda-env/
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+uv.lock
+
+# Build & distribution
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Testing and linting caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS and IDE files
+.DS_Store
+.idea/
+.vscode/
+
+# Subagent / Pi artifacts
+.pi-subagents/artifacts/
