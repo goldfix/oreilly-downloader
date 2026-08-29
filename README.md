@@ -4,8 +4,9 @@ O'Reilly provides all of their books in epub format, but only through their own
 reader.
 
 This script allows you to download all the individual files and assemble them
-back into a full epub. This allows you to use other readers, e.g. for
-accessibility reasons.
+back into a full, valid EPUB with responsive image and layout styling. This allows
+you to use other readers (e.g. Apple Books, Calibre, Kindle, Kobo), ensuring diagrams
+and figures adapt to any screen size.
 
 You need a valid JWT to download content. If you do not provide one, each
 chapter will be cut short. You can get it by logging in with your browser and

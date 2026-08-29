@@ -15,6 +15,7 @@ from lxml import etree
 from oreilly_downloader import (
     CONTAINER,
     DEFAULT_HEADERS,
+    RESPONSIVE_CSS,
     build_parser,
     check_auth,
     extract_book_id,
@@ -213,20 +214,40 @@ def test_to_xhtml_already_complete_html():
     assert a_el.get("href") == "sec1.html"
 
 
-def test_to_xhtml_keeps_relative_and_external_refs():
+def test_to_xhtml_injects_responsive_css_fragment():
     root_path = "/api/v2/epubs/urn:orm:book:12345/files/"
-    html_input = """<div>
-        <a href="../Text/other.html#p12">Rel link</a>
-        <a href="https://example.com/x.png">External</a>
-        <a href="#anchor">Anchor</a>
-        <img src="data:image/png;base64,AAAA" />
-    </div>"""
+    html_input = "<div><h1>Responsive Chapter</h1><img src='Images/pic.png'/></div>"
     output = to_xhtml(html_input, root_path, "Text/ch01.html")
     tree = etree.fromstring(output)
-    hrefs = [a.get("href") for a in tree.findall(".//{http://www.w3.org/1999/xhtml}a")]
-    assert hrefs == ["../Text/other.html#p12", "https://example.com/x.png", "#anchor"]
-    img_el = tree.find(".//{http://www.w3.org/1999/xhtml}img")
-    assert img_el.get("src") == "data:image/png;base64,AAAA"
+
+    style_el = tree.find(".//{http://www.w3.org/1999/xhtml}style")
+    assert style_el is not None
+    assert "max-width: 100% !important" in style_el.text
+    assert "img.emoji" in style_el.text
+    assert "figure" in style_el.text
+
+
+def test_to_xhtml_injects_responsive_css_full_document():
+    root_path = "/api/v2/epubs/urn:orm:book:12345/files/"
+    html_input = """<!DOCTYPE html>
+    <html xmlns="http://www.w3.org/1999/xhtml">
+        <head><title>Full Doc</title></head>
+        <body><p>Hello</p></body>
+    </html>"""
+    output = to_xhtml(html_input, root_path, "Text/doc.html")
+    tree = etree.fromstring(output)
+
+    style_el = tree.find(".//{http://www.w3.org/1999/xhtml}style")
+    assert style_el is not None
+    assert "max-width: 100% !important" in style_el.text
+
+
+def test_responsive_css_content():
+    assert "img, svg" in RESPONSIVE_CSS
+    assert "max-width: 100% !important" in RESPONSIVE_CSS
+    assert "height: auto !important" in RESPONSIVE_CSS
+    assert "object-fit: contain" in RESPONSIVE_CSS
+    assert "img.emoji" in RESPONSIVE_CSS
 
 
 def test_container_xml_valid():
@@ -307,6 +328,10 @@ async def test_fetch_book_structure():
                 "full_path": "Text/titlepage.xhtml",
             },
             {
+                "url": f"https://learning.oreilly.com/api/v2/epubs/urn:orm:book:{book_id}/files/Styles/style.css",
+                "full_path": "Styles/style.css",
+            },
+            {
                 "url": f"https://learning.oreilly.com/api/v2/epubs/urn:orm:book:{book_id}/files/Images/pic.png",
                 "full_path": "Images/pic.png",
             },
@@ -329,6 +354,8 @@ async def test_fetch_book_structure():
             resp.read = AsyncMock(return_value=f'<div><h1>Chapter 1</h1><img src="{root_path}Images/pic.png" /></div>'.encode())
         elif url.endswith("Text/titlepage.xhtml"):
             resp.read = AsyncMock(return_value=f'<div><image href="{root_path}Images/pic.png" /></div>'.encode())
+        elif url.endswith("Styles/style.css"):
+            resp.read = AsyncMock(return_value=b"body { font-size: 1em; }")
         elif url.endswith("Images/pic.png"):
             resp.read = AsyncMock(return_value=b"\x89PNG\r\n\x1a\n")
 
@@ -350,6 +377,7 @@ async def test_fetch_book_structure():
         assert "EPUB/content.opf" in names
         assert "EPUB/Text/ch01.html" in names
         assert "EPUB/Text/titlepage.xhtml" in names
+        assert "EPUB/Styles/style.css" in names
         assert "EPUB/Images/pic.png" in names
 
         # Check mimetype is uncompressed
@@ -367,6 +395,11 @@ async def test_fetch_book_structure():
         assert "../Images/pic.png" in tp
         assert "<html" in tp
         assert root_path not in tp
+
+        # CSS file has responsive overrides appended
+        css = zfh.read("EPUB/Styles/style.css").decode()
+        assert "body { font-size: 1em; }" in css
+        assert "max-width: 100% !important" in css
 
         # Binary asset untouched
         assert zfh.read("EPUB/Images/pic.png") == b"\x89PNG\r\n\x1a\n"

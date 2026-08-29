@@ -49,6 +49,7 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
                     └─► File di testo/capitoli (.html, .xhtml)
                           ├─► [to_xhtml(s, root_path, full_path)]
                           │     - Normalizzazione tag e doctype XHTML
+                          │     - Iniezione CSS responsive in <head> per adattamento immagini/SVG/figure
                           │     - Riscrittura percorsi relativi via posixpath.relpath (es. ../Images/pic.png da Text/)
                           │     - Wrapping in <html xmlns="http://www.w3.org/1999/xhtml"> se incompleto
                           │     - Generazione tag <head><title> da <h1>
@@ -70,7 +71,8 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
    - Cicla sulle pagine dell'API O'Reilly scaricando la lista dei file costituenti il libro.
    - Esegue il download asincrono controllato da `asyncio.Semaphore` per prevenire rate-limiting (HTTP 429).
    - Invia i file `.html` e `.xhtml` a `to_xhtml()` prima della memorizzazione nello ZIP.
-11. **`to_xhtml(s, root_path, dest_path)`**: Converte l'HTML in XHTML valido con namespace OEBPS e ripulisce gli attributi `src` e `href` convertendoli in percorsi relativi alla sottodirectory del file (es. `../Images/pic.png` da `Text/chapter.html`).
+   - Aggiunge in coda ai file `.css` le regole di override responsive `RESPONSIVE_CSS`.
+11. **`to_xhtml(s, root_path, dest_path)`**: Converte l'HTML in XHTML valido con namespace OEBPS, inietta un blocco `<style>` con regole responsive (`max-width: 100% !important; height: auto !important;`) per impedire lo sbordamento delle immagini, e ripulisce gli attributi `src` e `href` convertendoli in percorsi relativi alla sottodirectory del file (es. `../Images/pic.png` da `Text/chapter.html`).
 
 ---
 
@@ -107,6 +109,7 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
 | Download di 0 file per ISBN incompleto | ID a 12 cifre senza check digit (es. `978163343453`) | `normalize_book_id()` rileva prefissi a 12 cifre e calcola automaticamente la 13a cifra di controllo. |
 | `AttributeError: 'NoneType' object has no attribute 'startswith'` | Nodi di commento (`HtmlComment`) o attributi booleani durante `to_xhtml()` | Controllo esplicito su `val and isinstance(val, str) and val.startswith(...)` in `to_xhtml()`. |
 | Immagini o link non visibili nei reader EPUB | File HTML in sottocartelle (`EPUB/Text/`) ma percorsi privi di `../` per raggiungere `EPUB/Images/` | `to_xhtml()` calcola i percorsi relativi con `posixpath.relpath()` rispetto alla directory del file (`Text/` → `../Images/`). |
+| Immagini o figure che sbordano dalla pagina nei reader EPUB | Dimensioni fisse in pixel (es. `width="1116"`) e assenza di regole CSS responsive nel frammento HTML | Iniezione automatica di `RESPONSIVE_CSS` (`img, svg { max-width: 100% !important; height: auto !important; }`, gestione `img.emoji` e `figure`) in `<head>` e in coda ai file `.css`. |
 | Copertina (`titlepage.xhtml`) non visualizzata | I file `.xhtml` non venivano processati da `to_xhtml()`, mantenendo percorsi API assoluti non validi | `fetch_book()` processa sia file `.html` che `.xhtml`. |
 | Rate limiting (HTTP 429) su libri enormi | Troppe richieste simultanee verso il server | Concorrenza limitata e configurabile con `asyncio.Semaphore` (default: 10). |
 
@@ -169,3 +172,15 @@ Il componente centrale è lo script `oreilly_downloader.py`, strutturato in modo
   - `fetch_book()` ora processa anche i file `.xhtml` (prima solo `.html`): la copertina `Text/titlepage.xhtml` non era convertita e conteneva il percorso API assoluto rotto.
   - Verifica end-to-end: EPUB rigenerato con `../Images/...` corretti, zero percorsi API assoluti residui e **0 riferimenti rotti** (ogni src/href risolve a un file esistente nell'archivio).
   - Suite di test portata a **19 test passati al 100%** (`uv run pytest`), lint e format ok (`ruff`).
+
+### Sessione 6 - Stili CSS Responsive per Immagini e Figure (EPUB) (2026-08-25)
+- **Attività**:
+  - Risolto il problema delle immagini e figure che sbordano dalle dimensioni dello schermo nei lettori EPUB (immagini con larghezze fisse come 1116px o 1346px che non si adattavano al viewport).
+  - Definita la costante `RESPONSIVE_CSS`:
+    - `img, svg { max-width: 100% !important; height: auto !important; object-fit: contain; box-sizing: border-box; }` per adattare proporzionalmente immagini e grafici vettoriali.
+    - `img.emoji { width: 1.2em !important; height: 1.2em !important; ... }` per preservare la dimensione corretta degli emoji/icone inline.
+    - `figure, div.figure, div.informalfigure { max-width: 100% !important; box-sizing: border-box; }` per prevenire overflow orizzontale dei container.
+  - `to_xhtml()` inietta ora un elemento `<style type="text/css">` all'interno del tag `<head>` di ogni documento XHTML.
+  - `fetch_book()` appende inoltre le regole di override a qualsiasi foglio di stile `.css` scaricato.
+  - Aggiunti test di regressione dedicati per frammenti, documenti completi e file CSS.
+  - Suite di test estesa a **21 test passati al 100%** (`uv run pytest`), lint e format conformi (`ruff`).

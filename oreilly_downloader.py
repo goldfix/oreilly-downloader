@@ -40,6 +40,28 @@ DEFAULT_HEADERS = {
     "Referer": "https://learning.oreilly.com/",
 }
 
+RESPONSIVE_CSS = """
+img, svg {
+  max-width: 100% !important;
+  height: auto !important;
+  object-fit: contain;
+  box-sizing: border-box;
+}
+img.emoji {
+  width: 1.2em !important;
+  height: 1.2em !important;
+  max-width: 1.2em !important;
+  max-height: 1.2em !important;
+  vertical-align: -0.2em !important;
+  display: inline !important;
+  margin: 0 0.1em !important;
+}
+figure, div.figure, div.informalfigure {
+  max-width: 100% !important;
+  box-sizing: border-box;
+}
+""".strip()
+
 CONTAINER = b"""<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
     <rootfiles>
@@ -164,16 +186,30 @@ def to_xhtml(s: bytes | str, root_path: str, dest_path: str) -> bytes:
                 "epub": "http://www.idpf.org/2007/ops",
             },
         )
+        head = etree.SubElement(wrapper, "head")
 
         h1 = tree.find(".//h1") if isinstance(tree.tag, str) else None
         if h1 is not None:
-            head = etree.SubElement(wrapper, "head")
             title = etree.SubElement(head, "title")
             title.text = "".join(h1.itertext()).strip()
+
+        style_el = etree.SubElement(head, "style")
+        style_el.set("type", "text/css")
+        style_el.text = RESPONSIVE_CSS
 
         body = etree.SubElement(wrapper, "body")
         body.append(tree)
         tree = wrapper
+    else:
+        head = tree.find(".//{http://www.w3.org/1999/xhtml}head")
+        if head is None:
+            head = tree.find(".//head")
+        if head is None:
+            head = etree.Element("head")
+            tree.insert(0, head)
+        style_el = etree.SubElement(head, "style")
+        style_el.set("type", "text/css")
+        style_el.text = RESPONSIVE_CSS
 
     return etree.tostring(
         tree,
@@ -214,6 +250,8 @@ async def fetch_book(
             content = await r.read()
             if full_path.endswith((".html", ".xhtml")):
                 content = to_xhtml(content, root_path, full_path)
+            elif full_path.endswith(".css"):
+                content = content + f"\n\n/* Responsive image overrides */\n{RESPONSIVE_CSS}\n".encode()
             zfh.writestr(f"EPUB/{full_path}", content)
 
     zfh.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
